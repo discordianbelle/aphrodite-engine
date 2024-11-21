@@ -1,11 +1,14 @@
 """A layer that samples the next tokens from the model's outputs."""
 import itertools
+import os
+import warnings
 from math import inf
 from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 
+import aphrodite._custom_ops as ops
 from aphrodite.common.sampling_params import SamplingType
 from aphrodite.common.sequence import (CompletionSequenceGroupOutput, Logprob,
                                        PromptLogprobs, SampleLogprobs,
@@ -26,6 +29,11 @@ SampleResultType = List[Tuple[List[int], List[int]]]
 # This value was chosen because 1/2e-5 is just under the 65k fp16 max, meaning
 # that this temperature well-uses the fp16 space after the logits are offset.
 _TEMPERATURE_MINIMUM = 2e-5
+
+# If enabled, we switch to a more performant implementation
+# of top-k and top-p
+APHRODITE_USE_SAMPLING_KERNELS = bool(int(
+    os.getenv("APHRODITE_USE_SAMPLING_KERNELS", "0")))
 
 
 class Sampler(nn.Module):
@@ -77,7 +85,7 @@ class Sampler(nn.Module):
         # Initialize new sampling tensors
         (sampling_tensors, do_penalties, do_temperatures, do_top_p_top_k,
          do_top_as, do_min_p, do_tfss, do_eta_cutoffs, do_epsilon_cutoffs,
-         do_typical_ps, do_quadratic, do_xtc, do_nsigmas, do_temp_last
+         do_typical_ps, do_quadratic, do_xtc, do_nsigmas, do_dry, do_temp_last
          ) = SamplingTensors.from_sampling_metadata(
              sampling_metadata, vocab_size, logits.device, logits.dtype)
 
@@ -94,6 +102,7 @@ class Sampler(nn.Module):
         self._do_quadratic = do_quadratic
         self._do_xtc = do_xtc
         self._do_nsgimas = do_nsigmas
+        self._do_dry = do_dry
         self._do_temp_last = do_temp_last
 
     def forward(
@@ -133,6 +142,7 @@ class Sampler(nn.Module):
         do_quadratic = self._do_quadratic
         do_xtc = self._do_xtc
         do_nsigmas = self._do_nsgimas
+        do_dry = self._do_dry
         do_temp_last = self._do_temp_last
 
         logits = _apply_min_tokens_penalty(logits, sampling_metadata)
@@ -155,7 +165,7 @@ class Sampler(nn.Module):
         if do_nsigmas:
             logits = _apply_top_nsigma(logits, sampling_tensors.nsigmas)
 
-        if do_top_p_top_k:
+        if do_top_p_top_k and not APHRODITE_USE_SAMPLING_KERNELS:
             logits = _apply_top_k_top_p(logits, sampling_tensors.top_ps,
                                         sampling_tensors.top_ks)
 
@@ -188,6 +198,16 @@ class Sampler(nn.Module):
             logits = _apply_xtc_sampling(
                 logits, sampling_tensors.xtc_thresholds,
                 sampling_tensors.xtc_probabilities)
+
+        if do_dry:
+            logits = _apply_dry(
+                logits,
+                sampling_tensors.prompt_tokens,
+                sampling_tensors.dry_multipliers,
+                sampling_tensors.dry_bases, 
+                sampling_tensors.dry_allowed_lengths,
+                sampling_tensors.dry_sequence_breaker_ids
+            )
 
         if do_temperatures and do_temp_last:
             _apply_temperatures(logits, sampling_tensors.temperatures,
@@ -396,6 +416,92 @@ def _apply_min_tokens_penalty(
 
     # verifies that no rows in logits were missed unexpectedly
     assert logits_applied == logits.shape[0]
+    return logits
+
+def _apply_dry(
+    logits: torch.Tensor,
+    input_ids: torch.Tensor,
+    multipliers: torch.Tensor, 
+    bases: torch.Tensor,
+    allowed_lengths: torch.Tensor,
+    sequence_breakers_ids: torch.Tensor
+) -> torch.Tensor:
+    """
+    Apply Exclude Don't Repeat Yourself (DRY) sampling to the logits.
+    Reference: https://github.com/oobabooga/text-generation-webui/pull/5677
+    """
+    # Check if all multipliers are zero
+    if torch.all(multipliers == 0):
+        return logits
+      
+    # Process each sequence in the batch
+    for i, (input_ids_row, logits_row) in enumerate(zip(input_ids, logits)):
+        multiplier = multipliers[i].item()
+        if multiplier == 0:
+            continue  # Skip processing for this sequence
+          
+        # Get the last token
+        last_token = input_ids_row[-1].item()
+
+        # Skip if last token is a sequence breaker
+        if last_token in sequence_breakers_ids:
+            continue
+
+        # Find matches of the last token, excluding the last position
+        match_indices = (input_ids_row[:-1] == last_token).nonzero()
+
+        # Track max matching sequence length for each potential next token
+        match_lengths = {}
+
+        # Process each match
+        for idx in match_indices:
+            # Convert to scalar
+            idx = idx.item()
+            
+            # Get the token that followed this match in the input
+            next_token = input_ids_row[idx + 1].item()
+
+            # Skip if next token is a sequence breaker
+            if next_token in sequence_breakers_ids:
+                continue
+
+            # We found last_token matches at this index, so match length starts at 1
+            match_length = 1
+
+            # Try to extend match backwards
+            while True:
+                j = idx - match_length
+                k = len(input_ids_row) - match_length - 1
+                if j < 0 or k < 0:
+                    # Reached start of input
+                    break
+
+                if input_ids_row[j].item() != input_ids_row[k].item():
+                    # No more matches
+                    break
+
+                if input_ids_row[k].item() in sequence_breakers_ids:
+                    # Hit a sequence breaker
+                    break
+
+                match_length += 1
+
+            # Update max match length for this next token
+            if next_token in match_lengths:
+                match_lengths[next_token] = max(match_length, match_lengths[next_token])
+            else:
+                match_lengths[next_token] = match_length
+
+        # Apply penalties based on match lengths
+        allowed_length = allowed_lengths[i]
+        multiplier = multipliers[i]  
+        base = bases[i]
+
+        for token, match_length in match_lengths.items():
+            if match_length >= allowed_length:
+                penalty = multiplier * (base ** (match_length - allowed_length))
+                logits_row[token] -= penalty
+
     return logits
 
 
@@ -816,14 +922,7 @@ def _multinomial(
     seq_groups: Optional[List[SequenceGroupToSample]] = None,
 ) -> torch.Tensor:
     if num_samples > 1:
-        # This is equivalent to torch.repeat_interleaved (which also
-        # forces a GPU<->CPU sync).
-        # This allows us to do sampling with replacement by creating
-        # num_samples copies of each row in the tensor, and then
-        # batch sampling the resulting tensor.
-        probs = probs[:, None, :].expand(probs.shape[0], num_samples,
-                                         probs.shape[1]).contiguous().view(
-                                             -1, probs.shape[1])
+        probs = probs.repeat_interleave(num_samples, dim=0)
     q = torch.empty_like(probs)
     if seq_groups is None:
         q.exponential_()
@@ -831,17 +930,57 @@ def _multinomial(
         sample_idx = 0
         for seq_group in seq_groups:
             seq_ids = seq_group.seq_ids
-            next_sample_idx = sample_idx + len(seq_ids) * num_samples
-            q[sample_idx:next_sample_idx].exponential_(
-                generator=seq_group.generator)
-            sample_idx = next_sample_idx
+            stride = len(seq_ids) * num_samples
+            assert seq_group.generator is not None
+            q[sample_idx:sample_idx +
+              stride].exponential_(generator=seq_group.generator)
+            sample_idx += stride
     return probs.div_(q).argmax(dim=1).view(-1, num_samples)
+
+
+def _top_k_top_p_multinomial_with_kernels(
+        probs: torch.Tensor, top_ks: torch.Tensor, top_ps: torch.Tensor,
+        num_samples: int, seq_groups: Optional[List[SequenceGroupToSample]]):
+    max_top_k_round = 32
+    if num_samples > 1:
+        probs = probs.repeat_interleave(num_samples, dim=0)
+        top_ks = top_ks.repeat_interleave(num_samples)
+        top_ps = top_ps.repeat_interleave(num_samples)
+    batch_size = probs.shape[0]
+    uniform_samples = torch.empty((max_top_k_round, batch_size),
+                                  device=probs.device)
+    if seq_groups is None:
+        uniform_samples.uniform_()
+    else:
+        sample_idx = 0
+        for seq_group in seq_groups:
+            seq_ids = seq_group.seq_ids
+            stride = len(seq_ids) * num_samples
+            assert seq_group.generator is not None
+            uniform_samples[:, sample_idx:sample_idx +
+                            stride].uniform_(generator=seq_group.generator)
+            sample_idx += stride
+    batch_next_token_ids, success = ops.top_k_top_p_sampling_from_probs(
+        probs,
+        uniform_samples,
+        top_ks,
+        top_ps,
+    )
+    if not success.all():
+        warnings.warn("CUDA rejection sampling failed, fallback.",
+                      stacklevel=1)
+        probs = ops.top_k_renorm_prob(probs, top_ks)
+        probs = ops.top_p_renorm_prob(probs, top_ps)
+        batch_next_token_ids = ops.sampling_from_probs(
+            probs, uniform_samples[0])
+    return batch_next_token_ids.view(-1, num_samples)
 
 
 def _sample_with_torch(
     probs: torch.Tensor,
     logprobs: torch.Tensor,
     sampling_metadata: SamplingMetadata,
+    sampling_tensors: SamplingTensors,
     include_gpu_probs_tensor: bool,
     modify_greedy_probs: bool,
 ) -> Tuple[List[Tuple[List[int], List[int]]], Optional[torch.Tensor]]:
@@ -897,17 +1036,29 @@ def _sample_with_torch(
                     sampling_params = seq_group.sampling_params
                     max_best_of_in_batch = max(max_best_of_in_batch,
                                                sampling_params.best_of)
-            seeded_args = {} if sampling_type == SamplingType.RANDOM else {
-                "seq_groups": seq_groups,
-            }
 
-            multinomial_samples[sampling_type] = _multinomial(
-                probs[long_sample_indices], max_best_of_in_batch,
-                **seeded_args)
-            if include_gpu_probs_tensor:
+            seq_groups_arg = (None if sampling_type == SamplingType.RANDOM else
+                              seq_groups)
+            if APHRODITE_USE_SAMPLING_KERNELS is not None:
+                multinomial_samples[
+                    sampling_type] = _top_k_top_p_multinomial_with_kernels(
+                        probs[long_sample_indices],
+                        sampling_tensors.top_ks[long_sample_indices],
+                        sampling_tensors.top_ps[long_sample_indices],
+                        max_best_of_in_batch,
+                        seq_groups_arg,
+                    )
+            else:
+                multinomial_samples[sampling_type] = _multinomial(
+                    probs[long_sample_indices],
+                    max_best_of_in_batch,
+                    seq_groups=seq_groups_arg)
+
+            if sampled_token_ids_tensor is not None:
                 # Store sampled tokens in output tensor.
-                sampled_token_ids_tensor[
-                    long_sample_indices] = multinomial_samples[sampling_type]
+                sampled_token_ids_tensor[long_sample_indices] = \
+                    multinomial_samples[sampling_type].to(torch.long)
+
         elif sampling_type == SamplingType.BEAM:
             beam_search_logprobs = logprobs[sample_indices]
         else:
@@ -1035,6 +1186,7 @@ def _sample(
         probs,
         logprobs,
         sampling_metadata,
+        sampling_tensors,
         include_gpu_probs_tensor=include_gpu_probs_tensor,
         modify_greedy_probs=modify_greedy_probs,
     )
